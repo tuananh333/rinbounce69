@@ -3,177 +3,132 @@
  * A free open source mixin-based injection hacked client for Minecraft using Minecraft Forge.
  * https://github.com/rattermc/rinbounce69
  */
-package net.ccbluex.liquidbounce.features.module.modules.combat
+package net.ccbluex.liquidbounce.features.module.modules.combat;
 
-import net.ccbluex.liquidbounce.event.RotationUpdateEvent
-import net.ccbluex.liquidbounce.event.handler
-import net.ccbluex.liquidbounce.features.module.Category
-import net.ccbluex.liquidbounce.features.module.Module
-import net.ccbluex.liquidbounce.utils.extensions.sendUseItem
-import net.ccbluex.liquidbounce.utils.extensions.tryJump
-import net.ccbluex.liquidbounce.utils.inventory.InventoryUtils
-import net.ccbluex.liquidbounce.utils.inventory.InventoryUtils.serverOpenInventory
-import net.ccbluex.liquidbounce.utils.inventory.SilentHotbar
-import net.ccbluex.liquidbounce.utils.inventory.inventorySlot
-import net.ccbluex.liquidbounce.utils.inventory.isSplashPotion
-import net.ccbluex.liquidbounce.utils.kotlin.RandomUtils.nextFloat
-import net.ccbluex.liquidbounce.utils.movement.FallingPlayer
-import net.ccbluex.liquidbounce.utils.rotation.Rotation
-import net.ccbluex.liquidbounce.utils.rotation.RotationSettings
-import net.ccbluex.liquidbounce.utils.rotation.RotationUtils
-import net.ccbluex.liquidbounce.utils.rotation.RotationUtils.setTargetRotation
-import net.ccbluex.liquidbounce.utils.timing.MSTimer
-import net.ccbluex.liquidbounce.utils.timing.TickedActions.nextTick
-import net.minecraft.client.gui.inventory.GuiInventory
-import net.minecraft.item.ItemPotion
-import net.minecraft.potion.Potion
+import net.ccbluex.liquidbounce.event.AttackEvent;
+import net.ccbluex.liquidbounce.event.EventTarget;
+import net.ccbluex.liquidbounce.event.PacketEvent;
+import net.ccbluex.liquidbounce.event.UpdateEvent;
+import net.ccbluex.liquidbounce.features.module.Module;
+import net.ccbluex.liquidbounce.features.module.ModuleCategory;
+import net.ccbluex.liquidbounce.features.value.BoolValue;
+import net.ccbluex.liquidbounce.features.value.IntegerValue;
+import net.ccbluex.liquidbounce.features.value.ListValue;
+import net.ccbluex.liquidbounce.utils.MinecraftInstance;
+import net.ccbluex.liquidbounce.utils.timer.MSTimer;
+import net.minecraft.client.entity.EntityOtherPlayerMP;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.INetHandlerPlayClient;
 
-object AutoPot : Module("AutoPot", Category.COMBAT) {
+import java.util.concurrent.LinkedBlockingQueue;
 
-    private val health by float("Health", 15F, 1F..20F) { healPotion || regenerationPotion }
-    private val delay by int("Delay", 500, 500..1000)
+public class LegitReach extends Module {
 
-    // Useful potion options
-    private val healPotion by boolean("HealPotion", true)
-    private val regenerationPotion by boolean("RegenPotion", true)
-    private val fireResistancePotion by boolean("FireResPotion", true)
-    private val strengthPotion by boolean("StrengthPotion", true)
-    private val jumpPotion by boolean("JumpPotion", true)
-    private val speedPotion by boolean("SpeedPotion", true)
+    private final ListValue mode = new ListValue("Mode", new String[]{"FakePlayer", "AllIncomingPackets", "TargetPackets"}, "FakePlayer");
+    private final BoolValue aura = new BoolValue("Aura", false);
+    private final IntegerValue pulseDelay = new IntegerValue("PulseDelay", 200, 50, 500);
+    private final IntegerValue intavePacketDelay = new IntegerValue("Packets", 5, 0, 30);
 
-    private val openInventory by boolean("OpenInv", false)
-    private val simulateInventory by boolean("SimulateInventory", true) { !openInventory }
+    private final MSTimer pulseTimer = new MSTimer();
+    private EntityLivingBase currentTarget = null;
+    private EntityOtherPlayerMP fakePlayer = null;
+    private boolean shown = false;
+    private final LinkedBlockingQueue<Packet<INetHandlerPlayClient>> packets = new LinkedBlockingQueue<>();
 
-    private val groundDistance by float("GroundDistance", 2F, 0F..5F)
-    private val mode by choices("Mode", arrayOf("Normal", "Jump", "Port"), "Normal")
-
-    private val options = RotationSettings(this).withoutKeepRotation().apply {
-        resetTicksValue.excludeWithState()
-
-        immediate = true
+    public LegitReach() {
+        super("LegitReach", ModuleCategory.COMBAT);
     }
 
-    private val msTimer = MSTimer()
-    private var potion = -1
+    @Override
+    public void onEnable() {
+        shown = false;
+    }
 
-    val onRotationUpdate = handler<RotationUpdateEvent> {
-        if (!msTimer.hasTimePassed(delay) || mc.playerController.isInCreativeMode)
-            return@handler
+    @Override
+    public void onDisable() {
+        removeFakePlayer();
+        clearPackets();
+    }
 
-        val player = mc.thePlayer ?: return@handler
-
-        // Hotbar Potion
-        val potionInHotbar = findPotion(36, 44)
-
-        if (potionInHotbar != null) {
-            if (player.onGround) {
-                when (mode.lowercase()) {
-                    "jump" -> player.tryJump()
-                    "port" -> player.moveEntity(0.0, 0.42, 0.0)
-                }
+    @EventTarget
+    public void onAttack(AttackEvent event) {
+        if (mode.get().equalsIgnoreCase("FakePlayer")) {
+            if (event.getTargetEntity() instanceof EntityLivingBase) {
+                currentTarget = (EntityLivingBase) event.getTargetEntity();
+                createFakePlayer();
+                event.cancelEvent();
             }
-
-            // Prevent throwing potions into the void
-            val fallingPlayer = FallingPlayer(player)
-
-            val collisionBlock = fallingPlayer.findCollision(20)?.pos
-
-            if (player.posY - (collisionBlock?.y ?: return@handler) - 1 > groundDistance)
-                return@handler
-
-            potion = potionInHotbar
-
-            if (player.rotationPitch <= 80F) {
-                setTargetRotation(Rotation(player.rotationYaw, nextFloat(80F, 90F)).fixedSensitivity(), options)
-            }
-
-            nextTick {
-                SilentHotbar.selectSlotSilently(
-                    this,
-                    potion - 36,
-                    ticksUntilReset = 1,
-                    immediate = true,
-                    render = false,
-                    resetManually = true
-                )
-
-                if (potion >= 0 && RotationUtils.serverRotation.pitch >= 75F) {
-                    player.sendUseItem(player.heldItem)
-
-                    msTimer.reset()
-                    potion = -1
-                }
-            }
-            return@handler
         }
+    }
 
-        // Inventory Potion -> Hotbar Potion
-        val potionInInventory = findPotion(9, 36) ?: return@handler
+    @EventTarget
+    public void onPacket(PacketEvent event) {
+        Packet<?> packet = event.getPacket();
+        if (mode.get().equalsIgnoreCase("AllIncomingPackets") && currentTarget != null) {
+            if (packet.getClass().getSimpleName().startsWith("S")) {
+                event.cancelEvent();
+                packets.add((Packet<INetHandlerPlayClient>) packet);
+            }
+        }
+    }
 
-        if (InventoryUtils.hasSpaceInHotbar()) {
-            if (openInventory && mc.currentScreen !is GuiInventory)
-                return@handler
+    @EventTarget
+    public void onUpdate(UpdateEvent event) {
+        if (!mode.get().equalsIgnoreCase("FakePlayer")) {
+            if (pulseTimer.hasTimePassed(pulseDelay.get())) {
+                pulseTimer.reset();
+                clearPackets();
+            }
+        } else {
+            if (fakePlayer != null && currentTarget != null) {
+                syncFakePlayer();
+            }
+        }
+    }
 
-            nextTick {
-                if (simulateInventory)
-                    serverOpenInventory = true
+    private void createFakePlayer() {
+        if (currentTarget == null) return;
 
-                mc.playerController.windowClick(0, potionInInventory, 0, 1, player)
+        fakePlayer = new EntityOtherPlayerMP(MinecraftInstance.mc.theWorld, currentTarget.getGameProfile());
+        fakePlayer.copyLocationAndAnglesFrom(currentTarget);
 
-                if (simulateInventory && mc.currentScreen !is GuiInventory)
-                    serverOpenInventory = false
-
-                msTimer.reset()
+        for (int i = 0; i <= 4; i++) {
+            ItemStack stack = currentTarget.getEquipmentInSlot(i);
+            if (stack != null) {
+                fakePlayer.setCurrentItemOrArmor(i, ItemStack.copyItemStack(stack));
             }
         }
 
+        MinecraftInstance.mc.theWorld.addEntityToWorld(-1337, fakePlayer);
+        shown = true;
     }
 
-    private fun findPotion(startSlot: Int, endSlot: Int): Int? {
-        val player = mc.thePlayer
-
-        for (i in startSlot..endSlot) {
-            val stack = player.inventorySlot(i).stack
-
-            if (stack == null || stack.item !is ItemPotion || !stack.isSplashPotion())
-                continue
-
-            val itemPotion = stack.item as ItemPotion
-
-            for (potionEffect in itemPotion.getEffects(stack))
-                if (player.health <= health && healPotion && potionEffect.potionID == Potion.heal.id)
-                    return i
-
-            if (!player.isPotionActive(Potion.regeneration))
-                for (potionEffect in itemPotion.getEffects(stack))
-                    if (player.health <= health && regenerationPotion && potionEffect.potionID == Potion.regeneration.id)
-                        return i
-
-            if (!player.isPotionActive(Potion.fireResistance))
-                for (potionEffect in itemPotion.getEffects(stack))
-                    if (fireResistancePotion && potionEffect.potionID == Potion.fireResistance.id)
-                        return i
-
-            if (!player.isPotionActive(Potion.moveSpeed))
-                for (potionEffect in itemPotion.getEffects(stack))
-                    if (speedPotion && potionEffect.potionID == Potion.moveSpeed.id)
-                        return i
-
-            if (!player.isPotionActive(Potion.jump))
-                for (potionEffect in itemPotion.getEffects(stack))
-                    if (jumpPotion && potionEffect.potionID == Potion.jump.id)
-                        return i
-
-            if (!player.isPotionActive(Potion.damageBoost))
-                for (potionEffect in itemPotion.getEffects(stack))
-                    if (strengthPotion && potionEffect.potionID == Potion.damageBoost.id)
-                        return i
+    private void removeFakePlayer() {
+        if (fakePlayer != null) {
+            MinecraftInstance.mc.theWorld.removeEntityFromWorld(fakePlayer.getEntityId());
+            fakePlayer = null;
+            shown = false;
         }
-
-        return null
     }
 
-    override val tag
-        get() = health.toString()
+    private void syncFakePlayer() {
+        if (fakePlayer == null || currentTarget == null) return;
 
+        fakePlayer.setHealth(currentTarget.getHealth());
+
+        for (int i = 0; i <= 4; i++) {
+            ItemStack stack = currentTarget.getEquipmentInSlot(i);
+            if (stack != null) {
+                fakePlayer.setCurrentItemOrArmor(i, ItemStack.copyItemStack(stack));
+            }
+        }
+    }
+
+    private void clearPackets() {
+        while (!packets.isEmpty()) {
+            MinecraftInstance.mc.getNetHandler().addToSendQueue(packets.poll());
+        }
+    }
 }
